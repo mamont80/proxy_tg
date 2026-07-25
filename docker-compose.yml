@@ -14,9 +14,21 @@ services:
     # чтобы из контейнера можно было достучаться до сервисов на самом хосте
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # перечитывает конфиг и подхватывает обновлённые сертификаты каждые 6 часов
+    # перечитывает конфиг и подхватывает обновлённые сертификаты каждые 6 часов;
+    # раз в сутки ротирует access.log/error.log и удаляет ротированные логи старше 14 дней
     command: >
-      /bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g "daemon off;"'
+      /bin/sh -c '
+      (while :; do sleep 6h & wait $${!}; nginx -s reload; done) &
+      (while :; do
+        sleep 24h & wait $${!};
+        ts=$$(date +%Y%m%d);
+        for f in /var/log/nginx/access.log /var/log/nginx/error.log; do
+          [ -f "$$f" ] && mv "$$f" "$$f.$$ts";
+        done;
+        nginx -s reopen;
+        find /var/log/nginx -name "*.log.*" -mtime +14 -delete;
+      done) &
+      nginx -g "daemon off;"'
 
   certbot:
     image: certbot/certbot:latest
