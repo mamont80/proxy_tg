@@ -23,11 +23,16 @@ if [ -d "$DATA_PATH/conf/live" ]; then
   fi
 fi
 
-if [ ! -e "$DATA_PATH/conf/options-ssl-nginx.conf" ] || [ ! -e "$DATA_PATH/conf/ssl-dhparams.pem" ]; then
-  echo "### Скачиваю рекомендованные TLS-параметры ..."
-  mkdir -p "$DATA_PATH/conf"
-  curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf > "$DATA_PATH/conf/options-ssl-nginx.conf"
-  curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot/certbot/ssl-dhparams.pem > "$DATA_PATH/conf/ssl-dhparams.pem"
+mkdir -p "$DATA_PATH/conf"
+
+if [ ! -e "$DATA_PATH/conf/options-ssl-nginx.conf" ]; then
+  echo "### options-ssl-nginx.conf не найден. Файл должен идти в репозитории (certbot/conf/options-ssl-nginx.conf) — проверьте git." >&2
+  exit 1
+fi
+
+if [ ! -e "$DATA_PATH/conf/ssl-dhparams.pem" ]; then
+  echo "### Генерирую ssl-dhparams.pem локально (не скачиваю — путь certbot на GitHub периодически меняется и ломает curl) ..."
+  docker compose run --rm --entrypoint "openssl dhparam -out /etc/letsencrypt/ssl-dhparams.pem 2048" certbot
   echo
 fi
 
