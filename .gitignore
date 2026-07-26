@@ -8,3 +8,10 @@ certbot/conf/renewal/
 certbot/conf/accounts/
 certbot/conf/ssl-dhparams.pem
 nginx/logs/
+
+# секреты Local Bot API Server (api_id/api_hash с my.telegram.org)
+.env
+
+# рабочий каталог Local Bot API Server: база бота и скачанные/загружаемые файлы
+telegram-bot-api/data/
+telegram-bot-api/temp/

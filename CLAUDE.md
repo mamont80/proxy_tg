@@ -10,11 +10,12 @@ Nginx + certbot reverse proxy для mishaserver.ru. Конфиг живёт в 
   "/c/Program Files/PuTTY/plink.exe" -ssh -batch -i "C:\mamont\github-key-nopass\private.ppk" root@70.34.220.231 "команда"
   ```
   Флаг `-batch` обязателен, иначе plink может задать интерактивный вопрос (например про host key) и зависнуть.
-- **docker compose** сервисы: `mishaserver-nginx` (nginx:1.27-alpine) и `mishaserver-certbot`.
+- **docker compose** сервисы: `mishaserver-nginx` (nginx:1.27-alpine), `mishaserver-certbot`, `mishaserver-tg-bot-api` (Local Bot API Server) и `mishaserver-tg-files-cleaner`.
 - Прокси-маршруты (nginx/conf.d/mishaserver.conf):
   - `mishaserver.ru`, `www.`, `max.` → backend `217.25.219.93:80` (внешний сервис, не наш — не чинить, если недоступен).
   - `web.mishaserver.ru` → `host.docker.internal:8442` (локальный сервис на самом сервере, тоже сторонний относительно nginx-репо).
-  - `t.mishaserver.ru` → `https://api.telegram.org` (прокси для Telegram Bot API).
+  - `t.mishaserver.ru` → сервис `telegram-bot-api:8081` (свой Bot API Server), см. раздел ниже.
+- **Потребитель прокси**: бот `syncmax` (отдельный репозиторий, `/my/bot/sync_max_tg`, .NET, режим Webhook) ходит в Telegram через `Telegram__ApiBaseUrl=https://t.mishaserver.ru`. Правок в боте переключение на свой Bot API Server не потребовало.
 
 ## Инцидент 2026-07-25 и что было исправлено
 
@@ -44,7 +45,29 @@ Nginx + certbot reverse proxy для mishaserver.ru. Конфиг живёт в 
 
 Общие `proxy_*`-директивы для обоих location вынесены в `nginx/conf.d/proxy-telegram.inc`. Расширение `.inc`, а не `.conf`, — намеренно: `nginx.conf` делает `include /etc/nginx/conf.d/*.conf`, и файл с `.conf` был бы подхвачен вне `server`-блока и сломал бы конфиг.
 
-**Важно**: сам Bot API на `api.telegram.org` разрешает боту загружать файлы не больше 50 МБ (и скачивать до 20 МБ). Снятые здесь лимиты нужны, чтобы прокси не резал запрос раньше Telegram; чтобы реально заливать до 2 ГБ, нужен self-hosted [Local Bot API Server](https://core.telegram.org/bots/api#using-a-local-bot-api-server), и тогда `proxy_pass` в блоке `t.mishaserver.ru` надо переключить на него.
+## Local Bot API Server
+
+`t.mishaserver.ru` проксируется не на `api.telegram.org`, а на собственный [Bot API Server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) (сервис `telegram-bot-api`, образ `aiogram/telegram-bot-api`). Публичный сервер режет загрузку на 50 МБ, свой — поднимает до 2000 МБ.
+
+**Что именно даёт флаг `--local`** (проверено по исходникам `tdlib/telegram-bot-api`, файл `telegram-bot-api/Client.cpp`, а не по документации — она этого не разделяет):
+
+- **Загрузка (upload)**: лимита на размер в коде сервера нет вообще. 50 МБ — ограничение конкретно публичного `api.telegram.org`, любой self-hosted сервер его снимает, `--local` для этого не нужен.
+- **Скачивание (download)**: `Client.cpp:9369` — `if (!parameters_->local_mode_ && ... > MAX_DOWNLOAD_FILE_SIZE)`, где `MAX_DOWNLOAD_FILE_SIZE = 20 << 20`. Потолок 20 МБ снимается **только** флагом `--local`.
+- **Побочный эффект `--local`**: `Client.cpp:17817` — `getFile` начинает возвращать в `file_path` абсолютный путь на диске (`/var/lib/telegram-bot-api/<токен>/videos/file_5.mp4`) вместо относительного.
+
+Из-за последнего пункта в конфиге nginx есть regex-location, который ловит `/file/bot<токен>/var/lib/telegram-bot-api/...` и отдаёт файл прямо с диска через `alias` (каталог примонтирован в nginx на чтение). Клиентские библиотеки строят URL как `{base}/file/bot{token}/{file_path}`, получается двойной слэш — nginx схлопывает его сам, `merge_slashes` включён по умолчанию. Благодаря этому бота править не пришлось. Рядом оставлен обычный проксирующий `location /file/` на случай запуска без `--local` (regex приоритетнее префикса, так что он не перекрыт).
+
+**Секреты**: `api_id`/`api_hash` с https://my.telegram.org лежат в `.env` рядом с `docker-compose.yml` (в git не попадает, шаблон — `.env.example`). Это учётные данные приложения, а не бота: с токеном бота не связаны, одной пары хватает на всех ботов сервера. Без них контейнер падает на старте с `error: environment variable TELEGRAM_API_ID is required`.
+
+**Диск — главный риск.** Свободно ~9 ГБ при размере файла до 2 ГБ. Меры:
+
+- `proxy_request_buffering off` в `location /`: nginx стримит тело в бэкенд, а не пишет свою копию во временный файл. Бэкенд локальный, защищать его от медленного клиента смысла нет, а лишние 2 ГБ на диск — есть.
+- `limit_conn` ограничивает 2 одновременные большие передачи.
+- Bot API Server **сам ничего не удаляет** — принятые и скачанные файлы копятся, пока не кончится диск. Сервис `tg-files-cleaner` раз в 10 минут удаляет медиа старше часа. Чистит только внутри известных подкаталогов (`photos`, `videos`, `documents`, …), чтобы не задеть базу бота в корне `<token>/`; незнакомый подкаталог просто не будет чиститься — безопасный вид отказа.
+
+Порт `8081` наружу не публикуется, доступ только через nginx. Статистика: `docker exec mishaserver-tg-bot-api wget -qO- http://localhost:8082`.
+
+**Если бот вдруг перестанет видеть файлы**, проверять в первую очередь: права на `telegram-bot-api/data` (nginx-воркер работает под пользователем `nginx` и должен иметь доступ на чтение к каталогам, которые создаёт `telegram-bot-api`) и логи `docker logs mishaserver-tg-bot-api`.
 
 ## Ловушка "git pull на сервере не проходит"
 

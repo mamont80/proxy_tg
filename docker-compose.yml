@@ -11,9 +11,15 @@ services:
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
       - ./nginx/logs:/var/log/nginx
+      # Рабочий каталог Local Bot API Server, только на чтение.
+      # В режиме --local getFile отдаёт абсолютный путь к файлу, и nginx
+      # раздаёт такие файлы прямо с диска — см. location в mishaserver.conf.
+      - ./telegram-bot-api/data:/var/lib/telegram-bot-api:ro
     # чтобы из контейнера можно было достучаться до сервисов на самом хосте
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - telegram-bot-api
     # перечитывает конфиг и подхватывает обновлённые сертификаты каждые 6 часов;
     # раз в сутки ротирует access.log/error.log и удаляет ротированные логи старше 14 дней
     command: >
@@ -29,6 +35,61 @@ services:
         find /var/log/nginx -name "*.log.*" -mtime +14 -delete;
       done) &
       nginx -g "daemon off;"'
+
+  # Собственный Bot API Server вместо публичного api.telegram.org.
+  # Публичный сервер режет загрузку файлов на 50 МБ, свой — поднимает её до
+  # 2000 МБ. Флаг --local (TELEGRAM_LOCAL) дополнительно снимает потолок 20 МБ
+  # на скачивание; побочный эффект — getFile начинает возвращать абсолютный
+  # путь к файлу вместо относительного, это учтено в конфиге nginx.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: mishaserver-tg-bot-api
+    restart: unless-stopped
+    # api_id/api_hash с my.telegram.org; без них контейнер сразу падает.
+    # Шаблон — в .env.example, сам .env в git не попадает.
+    env_file: .env
+    environment:
+      TELEGRAM_LOCAL: "1"
+      # статистика на внутреннем порту 8082:
+      # docker exec mishaserver-tg-bot-api wget -qO- http://localhost:8082
+      TELEGRAM_STAT: "1"
+      TELEGRAM_VERBOSITY: "1"
+    volumes:
+      - ./telegram-bot-api/data:/var/lib/telegram-bot-api
+      # временные файлы приёма multipart-запросов; вынесены на хост, чтобы
+      # 2-гигабайтные заливки не росли в writable-слое контейнера вслепую
+      - ./telegram-bot-api/temp:/tmp/telegram-bot-api
+    # Наружу порт не публикуется: сервер доступен только внутри сети compose,
+    # снаружи — исключительно через nginx на t.mishaserver.ru.
+    expose:
+      - "8081"
+
+  # Bot API Server сам ничего не удаляет: и принятые, и скачанные файлы
+  # копятся в рабочем каталоге, пока не кончится диск (свободно ~9 ГБ при
+  # размере файла до 2 ГБ). Этот сервис раз в 10 минут подчищает медиа
+  # старше часа — бот-синхронизатор забирает файлы сразу, час с запасом.
+  #
+  # Удаляем только внутри известных медиа-подкаталогов, чтобы не задеть
+  # базу/бинлог бота в корне <token>/: незнакомый подкаталог просто не будет
+  # чиститься, а это безопасный вид отказа.
+  tg-files-cleaner:
+    image: alpine:3.20
+    container_name: mishaserver-tg-files-cleaner
+    restart: unless-stopped
+    volumes:
+      - ./telegram-bot-api/data:/var/lib/telegram-bot-api
+      - ./telegram-bot-api/temp:/tmp/telegram-bot-api
+    command: >
+      /bin/sh -c 'while :; do
+      for d in /var/lib/telegram-bot-api/*/*/; do
+      case "$${d%/}" in
+      */photos|*/videos|*/documents|*/animations|*/voice|*/video_notes|*/music|*/stickers|*/thumbnails|*/temp|*/profile_photos)
+      find "$$d" -type f -mmin +60 -delete 2>/dev/null ;;
+      esac;
+      done;
+      find /tmp/telegram-bot-api -type f -mmin +60 -delete 2>/dev/null;
+      sleep 10m & wait $${!};
+      done'
 
   certbot:
     image: certbot/certbot:latest
