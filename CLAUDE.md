@@ -31,6 +31,21 @@ Nginx + certbot reverse proxy для mishaserver.ru. Конфиг живёт в 
 - `init-letsencrypt.sh` переписан: больше не скачивает `options-ssl-nginx.conf`/`ssl-dhparams.pem` с GitHub (URL нестабильны), а требует, чтобы первый файл был в репозитории, второй — генерирует локально через openssl.
 - `init-letsencrypt.sh` помечен в git как исполняемый (`chmod +x` в дереве), чтобы `git pull` больше не конфликтовал из-за локального `chmod +x` на сервере.
 
+## Большие загрузки через t.mishaserver.ru
+
+`client_max_body_size` для `t.mishaserver.ru` поднят до 2 ГБ (по умолчанию в nginx — 1 МБ, остальные домены так и остались на дефолте). Тело запроса не держится в памяти: `client_body_buffer_size 256k`, всё сверх этого nginx спулит во временный файл `/var/cache/nginx/client_temp` внутри контейнера (это тот же раздел `/dev/vda2`, где живёт всё остальное). На сервере ~950 МБ RAM и ~9 ГБ свободного диска, поэтому:
+
+- две `limit_conn`-зоны (`tg_big_ip`, `tg_big_all`) ограничивают 2 больших загрузки с одного IP и 3 суммарно — в пике это ~6 ГБ временных файлов;
+- «большой» запрос определяется через `map $content_length` (>= 10 МБ, т.е. 8+ цифр). Ключ с пустым значением в `limit_conn` не учитывается, поэтому обычные вызовы Bot API и долгий `getUpdates` под лимит не попадают;
+- запрос с `Transfer-Encoding: chunked` (без `Content-Length`) под `limit_conn` не попадёт — его ограничивает только `client_max_body_size`. Штатные клиенты Bot API отправляют `Content-Length`;
+- если свободное место на диске изменится, тюнить надо числа в `limit_conn` в `nginx/conf.d/mishaserver.conf`.
+
+`location /file/` (скачивание файлов) вынесен отдельно: там `proxy_buffering off` и `proxy_max_temp_file_size 0`, чтобы большой ответ шёл клиенту потоком, а не складывался на диск.
+
+Общие `proxy_*`-директивы для обоих location вынесены в `nginx/conf.d/proxy-telegram.inc`. Расширение `.inc`, а не `.conf`, — намеренно: `nginx.conf` делает `include /etc/nginx/conf.d/*.conf`, и файл с `.conf` был бы подхвачен вне `server`-блока и сломал бы конфиг.
+
+**Важно**: сам Bot API на `api.telegram.org` разрешает боту загружать файлы не больше 50 МБ (и скачивать до 20 МБ). Снятые здесь лимиты нужны, чтобы прокси не резал запрос раньше Telegram; чтобы реально заливать до 2 ГБ, нужен self-hosted [Local Bot API Server](https://core.telegram.org/bots/api#using-a-local-bot-api-server), и тогда `proxy_pass` в блоке `t.mishaserver.ru` надо переключить на него.
+
 ## Ловушка "git pull на сервере не проходит"
 
 Если pull ругается `Your local changes to the following files would be overwritten by merge` — значит на сервере в рабочем дереве есть расхождение (по содержимому ИЛИ просто по правам доступа/исполняемому биту) с версией, закоммиченной в git. Частый случай — кто-то сделал `chmod +x` на сервере, а в git файл — обычный (0644); тогда diff показывает "0 insertions/deletions" но `mode change`.
