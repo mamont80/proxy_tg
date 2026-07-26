@@ -67,7 +67,17 @@ Nginx + certbot reverse proxy для mishaserver.ru. Конфиг живёт в 
 
 Порт `8081` наружу не публикуется, доступ только через nginx. Статистика: `docker exec mishaserver-tg-bot-api wget -qO- http://localhost:8082`.
 
-**Если бот вдруг перестанет видеть файлы**, проверять в первую очередь: права на `telegram-bot-api/data` (nginx-воркер работает под пользователем `nginx` и должен иметь доступ на чтение к каталогам, которые создаёт `telegram-bot-api`) и логи `docker logs mishaserver-tg-bot-api`.
+**Хрупкое место — совпадение uid.** Bot API Server создаёт файлы с правами `0600` под пользователем `telegram-bot-api` (uid 101), а nginx-воркер в `nginx:1.27-alpine` работает под пользователем `nginx`, у которого uid тоже 101. Именно поэтому nginx вообще может читать эти файлы и отдавать их клиенту. Это совпадение двух независимых образов, а не гарантия: смена базового образа (особенно `aiogram/telegram-bot-api:latest` — тег плавающий) может тихо сломать скачивание файлов, и симптомом будет `403 Forbidden` на `/file/...` при живом боте.
+
+Проверка одной командой:
+
+```
+docker exec -u nginx mishaserver-nginx sh -c 'cat /var/lib/telegram-bot-api/tqueue.binlog >/dev/null && echo READABLE'
+```
+
+Если станет `DENIED` — либо привести uid к общему знаменателю, либо раздавать файлы не через nginx, а проксированием на сам Bot API Server (тот самый резервный `location /file/`).
+
+**Обязательный шаг при переезде бота на свой сервер** (README `tdlib/telegram-bot-api`, раздел «Moving a bot to a local server»): бот должен быть разлогинен на публичном сервере вызовом `logOut` **на `https://api.telegram.org`** (не через `t.mishaserver.ru` — там теперь свой сервер). Иначе нет гарантии, что бот получит все апдейты. После `logOut` вернуться на облачный сервер можно, но только через 10 минут.
 
 ## Ловушка "git pull на сервере не проходит"
 
